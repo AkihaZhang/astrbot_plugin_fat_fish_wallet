@@ -34,7 +34,7 @@ def _to_seconds(hhmm: str) -> int:
 
 
 def parse_periods(spec: str) -> list[Period]:
-    """解析 '09:00-12:00,14:00-18:30'，非法段忽略。"""
+    """解析 '09:00-12:00,14:00-18:00'，非法段忽略。"""
     periods = []
     if not spec:
         return periods
