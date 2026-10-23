@@ -214,7 +214,17 @@ astrbot_plugin_fat_fish_wallet/
 python -m unittest discover -s tests
 ```
 
-覆盖的是节假日判定、手动开关优先级、`holidays` 缺失时的退化、提醒在假期不发、状态文案和下次切换的一致性这些。改 `main.py` 里策略相关的逻辑前，先跑一遍心里有底。
+覆盖的是节假日判定、手动开关优先级、`holidays` 缺失时的退化、提醒在假期不发、状态文案和下次切换的一致性、以及时段切换时的并发去重。改 `main.py` 里策略相关的逻辑前，先跑一遍心里有底。
+
+## 贡献者
+
+感谢 **[QHongboQ](https://github.com/QHongboQ)**。1.1.2 那版的功能基本都是他一个人写进 [PR #2](https://github.com/foxchuqiao/astrbot_plugin_fat_fish_wallet/pull/2) 的：
+
+- 把判定抽成只读的 `get_wallet_policy()` 公共接口，让消息闸门、`/峰谷` 状态、启动日志和定时提醒共用同一套逻辑
+- 让自动模式下的中国法定节假日按空闲处理，同时保住手动强制开关的优先级
+- 补上 `holidays` 依赖、公开接口文档、更新日志，以及一套确定性的策略测试
+
+也就是说，节假日不再被拦、其他插件能直接查询这套策略，都是他的功劳。你自己用着舒服的话，可以去他那边说声谢谢。
 
 ## 更新日志
 

@@ -26,16 +26,7 @@ REMINDER_WINDOW = timedelta(minutes=3)
 
 
 class _NoticeLedger:
-    """进程内的一次性认领表，用来保证「同一个切换点、同一个会话只喊一次」。
-
-    AstrBot 的事件总线是每条消息一个 asyncio 任务，同一瞬间可能有好几条消息
-    同时跑进闸门。只要判定和落盘之间隔着 await，它们就都会读到「还没喊过」，
-    于是连着发好几条一样的提示。
-
-    claim() 全程没有 await，在 asyncio 单线程下「查 + 占位」是原子的，所以并发
-    进来的任务里只有一个能拿到 True。放在模块级是因为插件重载后新旧实例可能
-    同时活着（旧实例的提醒循环还没被取消），共享一份账本才不会各喊各的。
-    """
+    """同一个切换点、同一个会话只发一次。claim 里没有 await，并发下天然原子。"""
 
     def __init__(self) -> None:
         self._day = ""
@@ -51,6 +42,7 @@ class _NoticeLedger:
         return True
 
 
+# 模块级：插件重载后新旧实例共用一份，免得两边各喊一次
 NOTICE_LEDGER = _NoticeLedger()
 
 
@@ -105,15 +97,10 @@ class FatFishWalletGuard(Star):
         return parse_weekdays(str(self._cfg("peak_weekdays", "0,1,2,3,4,5,6") or ""))
 
     def _segment_at(self, at: datetime) -> tuple[datetime, str]:
-        """当前处在哪个「状态段」的开头，以及这段是高峰还是空闲。
-
-        端点全部取时钟时刻，所以同一段时间里反复算出来的起点完全一致，用它做
-        认领键才不会因为并发算出两个不同的值。
-        """
+        """当前状态段的起点，以及这段是 peak 还是 offpeak。"""
         midnight = at.replace(hour=0, minute=0, second=0, microsecond=0)
         periods = self._periods()
         if not periods or self.get_wallet_policy(at=at, provider_id=None)["holiday"]:
-            # 节假日整天按空闲算，一整天就是一个段
             return midnight, "offpeak"
 
         weekdays = self._weekdays()
@@ -127,7 +114,7 @@ class FatFishWalletGuard(Star):
             marks.add(self._datetime_at(midnight, period.end))
         state = state_of(at)
         start = midnight
-        # 从最近的一个端点往回走，只要状态一样就继续往前，直到撞上状态不同的一刻
+        # 端点全是时钟时刻，并发时算出来的键必然一致
         for mark in sorted((m for m in marks if m <= at), reverse=True):
             if state_of(mark) != state:
                 break
@@ -135,7 +122,7 @@ class FatFishWalletGuard(Star):
         return start, state
 
     def _boundary_key(self, at: datetime) -> tuple[str, str, datetime]:
-        """返回 (日期, 认领键, 段起点)。认领键与状态段一一对应。"""
+        """(日期, 认领键, 段起点)，一个认领键对应一个状态段。"""
         start, state = self._segment_at(at)
         midnight = start.replace(hour=0, minute=0, second=0, microsecond=0)
         seconds = int((start - midnight).total_seconds())
@@ -143,7 +130,6 @@ class FatFishWalletGuard(Star):
         return day, f"{day}:{seconds}:{state}", start
 
     def _claim_notice(self, at: datetime, umo: str, suffix: str = "") -> bool:
-        """认领「这个切换点要往这个会话喊一声」。并发进来的只有一个能拿到 True。"""
         day, key, _ = self._boundary_key(at)
         return NOTICE_LEDGER.claim(day, f"{key}|{umo}{suffix}")
 
@@ -460,8 +446,7 @@ class FatFishWalletGuard(Star):
                         "manual_block_msg", "服务已被管理员手动关闭（拦截），等待恢复。"
                     )
                 else:
-                    # 同一段高峰里每个会话只讲一次「已进入」，其余用「当前处于」，
-                    # 并发进来的消息里只有一个能认领到，不会连发
+                    # 每会话每段高峰只讲一次「已进入」
                     if self._claim_notice(now, umo, "|peak-enter"):
                         msg = self._cfg(
                             "peak_msg_enter",
@@ -488,18 +473,14 @@ class FatFishWalletGuard(Star):
             logger.error(f"[大肥鱼钱包保卫战] peak_gate 异常: {e}")
 
     async def _announce_offpeak(self, event, now, umo):
-        """空闲时段到了，往这个会话说一声。同一个切换点每个会话只说一次。
-
-        只在切换后的一小段时间内说，过期就不提了——不然下午五点有人在群里
-        随口一句，机器人突然回「已到达空闲时段」，看着很怪。
-        """
+        """空闲到了就往这个会话说一声，同一切换点每个会话只说一次。"""
         if not self._cfg("announce_transition", True):
             return
         window = max(0, int(self._cfg("transition_notice_window_minutes", 10)))
         _, _, segment_start = self._boundary_key(now)
         if window and (now - segment_start) > timedelta(minutes=window):
             return
-        # 先认领再发：提醒循环用的是同一把钥匙，所以同一个群里不会既收提醒又收这条
+        # 提醒循环用的是同一把钥匙，抢不到说明已经有人讲过了
         if not self._claim_notice(now, umo):
             return
         if not await self._can_notice(event):
@@ -526,8 +507,7 @@ class FatFishWalletGuard(Star):
         if mode == "always":
             return True
         umo = event.unified_msg_origin
-        # 先在进程内原子占位，再读 KV：同一秒并发进来的私信只有一个能放行，
-        # KV 那份只是给重启后留个记号
+        # 先原子占位再读 KV，同一秒并发进来的私信只放行一条；KV 那份留给重启后用
         today = self._now().strftime("%Y-%m-%d")
         if not NOTICE_LEDGER.claim(today, f"{today}|{umo}|private-notice"):
             return False
@@ -829,7 +809,7 @@ class FatFishWalletGuard(Star):
                 continue
             if not (moment <= now < moment + REMINDER_WINDOW):
                 continue
-            # 每个目标单独认领：已经通过闸门收到过这条提示的会话不再重复推一遍
+            # 闸门已经讲过的会话不再重复推
             targets = []
             for umo in self._resolve_reminder_targets():
                 if self._claim_notice(boundary_at, umo):

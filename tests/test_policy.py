@@ -287,11 +287,7 @@ def event_text(event) -> str:
 
 
 class NoticeSpamTests(unittest.IsolatedAsyncioTestCase):
-    """时段切换时的重复推送回归测试。
-
-    AstrBot 的事件总线对每条消息都 create_task 一次，同一瞬间进来的几条消息
-    会并发跑进闸门。判定和落盘之间只要隔着 await，它们就会各发一条相同的提示。
-    """
+    """时段切换时的重复推送回归。AstrBot 每条消息一个 task，并发下会连发。"""
 
     def setUp(self):
         NOTICE_LEDGER._day = ""

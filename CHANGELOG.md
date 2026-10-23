@@ -27,6 +27,8 @@
 
 ## [1.1.2] - 2026-10-07
 
+感谢 [QHongboQ](https://github.com/QHongboQ) 贡献这一版，节假日策略与公共接口都是他在 [PR #2](https://github.com/foxchuqiao/astrbot_plugin_fat_fish_wallet/pull/2) 里写的。
+
 ### 新增
 
 - 增加公开只读 `get_wallet_policy()` 接口，供其他插件使用。
