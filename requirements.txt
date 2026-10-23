@@ -1,3 +1,4 @@
 # Windows 下 Python 的 zoneinfo 需要 tzdata 数据库（PEP 615）
 tzdata; sys_platform == "win32"
+# 中国法定节假日数据，自动模式下用来跳过假期；装不上会退回纯时段判断
 holidays
