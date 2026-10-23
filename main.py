@@ -11,6 +11,7 @@ from astrbot.api.star import Context, Star
 
 from .scheduler import (
     DEFAULT_PEAK_PERIODS,
+    DEFAULT_WEEKDAYS,
     fmt_duration,
     fmt_periods_for_display,
     get_zoneinfo,
@@ -44,6 +45,33 @@ class _NoticeLedger:
 
 # 模块级：插件重载后新旧实例共用一份，免得两边各喊一次
 NOTICE_LEDGER = _NoticeLedger()
+
+# holidays.CN() 每次实例化都要解析整年日历，逐年缓存一份
+_HOLIDAY_CALENDARS: dict[int, object] = {}
+_HOLIDAY_WARNED = False
+
+
+def _holiday_name(day) -> str:
+    """当天是不是中国法定节假日，是就返回节日名，否则空串。"""
+    global _HOLIDAY_WARNED
+    try:
+        import holidays
+    except Exception as exc:
+        if not _HOLIDAY_WARNED:
+            _HOLIDAY_WARNED = True
+            logger.warning(f"[大肥鱼钱包保卫战] holidays 不可用，按星期/时段计算：{exc}")
+        return ""
+    calendar = _HOLIDAY_CALENDARS.get(day.year)
+    if calendar is None:
+        try:
+            calendar = holidays.CN(years=day.year)
+        except Exception as exc:
+            if not _HOLIDAY_WARNED:
+                _HOLIDAY_WARNED = True
+                logger.warning(f"[大肥鱼钱包保卫战] holidays.CN() 构造失败：{exc}")
+            return ""
+        _HOLIDAY_CALENDARS[day.year] = calendar
+    return str(calendar.get(day) or "")
 
 
 _PROVIDER_NAMES = {
@@ -80,6 +108,7 @@ class FatFishWalletGuard(Star):
         self._groups_loaded = False
         self._known_groups: set[str] = set()
         self._reminder_task: asyncio.Task | None = None
+        self._stats_lock = asyncio.Lock()
 
     def _cfg(self, key, default=None):
         try:
@@ -94,7 +123,7 @@ class FatFishWalletGuard(Star):
         return parse_periods(str(self._cfg("peak_periods", DEFAULT_PEAK_PERIODS)))
 
     def _weekdays(self):
-        return parse_weekdays(str(self._cfg("peak_weekdays", "0,1,2,3,4,5,6") or ""))
+        return parse_weekdays(str(self._cfg("peak_weekdays", DEFAULT_WEEKDAYS) or ""))
 
     def _segment_at(self, at: datetime) -> tuple[datetime, str]:
         """当前状态段的起点，以及这段是 peak 还是 offpeak。"""
@@ -160,14 +189,8 @@ class FatFishWalletGuard(Star):
             provider = None
         affected = self._provider_affected(provider_id, provider)
         holiday_name = ""
-        try:
-            import holidays
-
-            holiday_name = str(holidays.CN().get(local_at.date()) or "")
-        except Exception as exc:
-            logger.warning(
-                f"[大肥鱼钱包保卫战] holidays.CN() 不可用，按星期/时段计算：{exc}"
-            )
+        if self._cfg("skip_cn_holidays", True):
+            holiday_name = _holiday_name(local_at.date())
         holiday = bool(holiday_name)
 
         if not enabled:
@@ -193,7 +216,7 @@ class FatFishWalletGuard(Star):
             "holiday": holiday,
             "holiday_name": holiday_name,
             "peak_periods": str(self._cfg("peak_periods", DEFAULT_PEAK_PERIODS)),
-            "peak_weekdays": str(self._cfg("peak_weekdays", "0,1,2,3,4,5,6") or ""),
+            "peak_weekdays": str(self._cfg("peak_weekdays", DEFAULT_WEEKDAYS) or ""),
             "evaluated_at": local_at,
         }
 
@@ -253,10 +276,6 @@ class FatFishWalletGuard(Star):
             return name
         t = str(getattr(meta, "type", "") or "").lower()
         return _PROVIDER_NAMES.get(t, t.capitalize() or "当前模型")
-
-    async def _provider_name(self, umo) -> str:
-        _, prov = await self._get_current_provider(umo)
-        return self._provider_display(prov)
 
     def _provider_status_text(self, provider_id, prov) -> str:
         if not provider_id:
@@ -355,15 +374,17 @@ class FatFishWalletGuard(Star):
     # 统计
 
     async def _bump_stats(self, key):
-        try:
-            today = self._now().strftime("%Y-%m-%d")
-            stats = await self.get_kv_data("stats", {}) or {}
-            if stats.get("date") != today:
-                stats = {"date": today, "blocked": 0, "bypassed": 0}
-            stats[key] = int(stats.get(key, 0)) + 1
-            await self.put_kv_data("stats", stats)
-        except Exception:
-            pass
+        # 读-改-写在并发消息下会丢计数，加锁串行化
+        async with self._stats_lock:
+            try:
+                today = self._now().strftime("%Y-%m-%d")
+                stats = await self.get_kv_data("stats", {}) or {}
+                if stats.get("date") != today:
+                    stats = {"date": today, "blocked": 0, "bypassed": 0}
+                stats[key] = int(stats.get(key, 0)) + 1
+                await self.put_kv_data("stats", stats)
+            except Exception:
+                pass
 
     async def _today_stats(self):
         try:
@@ -428,7 +449,7 @@ class FatFishWalletGuard(Star):
             await self._load_whitelist()
             now = self._now()
             umo = event.unified_msg_origin
-            provider_id, _ = await self._get_current_provider(umo)
+            provider_id, prov = await self._get_current_provider(umo)
             policy = self.get_wallet_policy(at=now, provider_id=provider_id)
             peak = policy["state"] == "peak"
             gated, reason = self._gate_decision(event, policy)
@@ -440,7 +461,7 @@ class FatFishWalletGuard(Star):
                 await self._bump_stats("blocked")
                 if not await self._can_notice(event):
                     return
-                provider = await self._provider_name(umo)
+                provider = self._provider_display(prov)
                 if reason == "manual":
                     msg = self._cfg(
                         "manual_block_msg", "服务已被管理员手动关闭（拦截），等待恢复。"
@@ -468,11 +489,11 @@ class FatFishWalletGuard(Star):
 
             # 仅自动模式下处理自然时段切换提示
             if not peak and override == "auto":
-                await self._announce_offpeak(event, now, umo)
+                await self._announce_offpeak(event, now, umo, prov)
         except Exception as e:
             logger.error(f"[大肥鱼钱包保卫战] peak_gate 异常: {e}")
 
-    async def _announce_offpeak(self, event, now, umo):
+    async def _announce_offpeak(self, event, now, umo, prov=None):
         """空闲到了就往这个会话说一声，同一切换点每个会话只说一次。"""
         if not self._cfg("announce_transition", True):
             return
@@ -485,7 +506,7 @@ class FatFishWalletGuard(Star):
             return
         if not await self._can_notice(event):
             return
-        provider = await self._provider_name(umo)
+        provider = self._provider_display(prov)
         await event.send(
             self._notice(
                 self._cfg(

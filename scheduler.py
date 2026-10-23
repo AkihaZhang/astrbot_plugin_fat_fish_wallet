@@ -1,12 +1,13 @@
 """峰谷时段计算，不依赖 astrbot，可单独测试。
 
-高峰时段默认：09:00-12:00、14:00-18:30（含开始，不含结束）。
+默认值按 DeepSeek 现行规则：高峰为北京时间 09:00-12:00、14:00-18:00，
+周一至周五，法定节假日全天空闲（含开始，不含结束）。
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Optional
 
 try:
@@ -14,8 +15,8 @@ try:
 except ImportError:  # pragma: no cover
     ZoneInfo = None
 
-DEFAULT_PEAK_PERIODS = "09:00-12:00,14:00-18:30"
-DEFAULT_WEEKDAYS = "0,1,2,3,4,5,6"
+DEFAULT_PEAK_PERIODS = "09:00-12:00,14:00-18:00"
+DEFAULT_WEEKDAYS = "0,1,2,3,4"
 
 
 @dataclass(frozen=True)
@@ -72,29 +73,6 @@ def is_peak(dt: datetime, periods: list[Period], weekdays: list[int]) -> bool:
         return False
     t = day_seconds(dt)
     return any(p.contains(t) for p in periods)
-
-
-def next_transition(
-    now: datetime,
-    periods: list[Period],
-    weekdays: list[int],
-) -> tuple[str, datetime]:
-    """下一次切换：返回（切换后的时段, 切换时刻），9 天内没有则返回 30 天后。"""
-    for day_offset in range(0, 10):
-        base_date = now.date() + timedelta(days=day_offset)
-        base = datetime(base_date.year, base_date.month, base_date.day, tzinfo=now.tzinfo)
-        boundaries = [base]
-        if not weekdays or base_date.weekday() in weekdays:
-            for p in periods:
-                boundaries.append(base + timedelta(seconds=p.start))
-                boundaries.append(base + timedelta(seconds=p.end))
-        for b in sorted(boundaries):
-            if b <= now:
-                continue
-            before = b - timedelta(seconds=1)
-            if is_peak(before, periods, weekdays) != is_peak(b, periods, weekdays):
-                return ("peak" if is_peak(b, periods, weekdays) else "offpeak", b)
-    return ("offpeak", now + timedelta(days=30))
 
 
 def fmt_duration(seconds: float | int) -> str:

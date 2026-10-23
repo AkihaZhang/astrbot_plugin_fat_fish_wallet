@@ -10,19 +10,24 @@
     "default": "Asia/Shanghai"
   },
   "peak_periods": {
-    "description": "高峰时段，如 09:00-12:00,14:00-18:30",
+    "description": "高峰时段，如 09:00-12:00,14:00-18:00",
     "type": "string",
-    "default": "09:00-12:00,14:00-18:30"
+    "default": "09:00-12:00,14:00-18:00"
   },
   "peak_weekdays": {
-    "description": "生效星期，0=周一…6=周日，留空=每天",
+    "description": "高峰生效的星期，0=周一…6=周日，留空=每天",
     "type": "string",
-    "default": "0,1,2,3,4,5,6"
+    "default": "0,1,2,3,4"
   },
   "affected_providers": {
     "description": "要拦截的供应商匹配词，* 表示全部",
     "type": "string",
     "default": "deepseek"
+  },
+  "skip_cn_holidays": {
+    "description": "中国法定节假日整天按空闲处理（DeepSeek 的规则；换别家且对方没这条规则时关掉）",
+    "type": "bool",
+    "default": true
   },
   "gate_when_provider_unknown": {
     "description": "识别不到供应商时也拦截",
