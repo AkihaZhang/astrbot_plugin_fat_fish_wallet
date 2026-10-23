@@ -32,6 +32,10 @@
 - 时段、星期、时区、提示文案、图片、提醒目标均可配置
 - 全平台通用（aiocqhttp、telegram、lark、discord 等）
 
+## 公共策略接口
+
+其他插件可调用活动实例的 `FatFishWalletGuard.get_wallet_policy(*, at=None, provider_id=None)` 获取只读决策。返回内容包括 `enabled`、`allowed`、`state`、`timezone`、`manual_override`、`provider_affected`、`holiday`、`holiday_name`、`peak_periods` 和 `peak_weekdays`。普通消息闸门、`/峰谷` 状态、启动状态和高峰提醒均使用同一策略函数；自动模式按 `holidays.CN()` 将中国法定节假日视为非高峰，节假日不会生成虚假的进/出高峰提醒。强制放行/拦截及总开关优先于自动时段策略；此接口不处理管理员或白名单豁免。
+
 ## 安装
 
 1. 将 `astrbot_plugin_fat_fish_wallet` 文件夹放入 AstrBot 的 `data/plugins/` 目录，或在 WebUI 插件页选择「上传安装」上传 `astrbot_plugin_fat_fish_wallet.zip`。
@@ -54,7 +58,6 @@
 | `/白名单 清空` | 清空白名单 | 管理员 |
 
 命令别名：`/峰谷` 也支持 `/时段`、`/peak`、`/钱包`、`/谷`；`/白名单` 也支持 `/wl`、`/whitelist`。
-
 提示仅在唤醒消息（带唤醒前缀，如 `@机器人` 或自定义前缀词）时回复；普通群聊消息会被静默拦截，不刷屏。手动强制开启/关闭时不触发自然时段切换提示。
 
 ## 配置项

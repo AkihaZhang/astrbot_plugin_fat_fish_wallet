@@ -13,7 +13,7 @@ desc: |
   - 时段自动提醒：高峰开始前提醒、高峰结束（12:00/18:30）提醒空闲到来，可指定群聊
   - /峰谷 查询当前时段、供应商、下次切换、今日统计；管理员可手动强制开启(放行)/关闭(拦截)
   - 时段、星期、时区、文案、图片、提醒目标均可配置，全平台通用
-version: 1.1.1
+version: 1.1.2
 author: foxchuqiao
 repo: https://github.com/foxchuqiao/astrbot_plugin_fat_fish_wallet
 astrbot_version: ">=4.9.2"

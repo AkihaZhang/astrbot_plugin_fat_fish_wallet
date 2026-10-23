@@ -15,7 +15,6 @@ from .scheduler import (
     fmt_periods_for_display,
     get_zoneinfo,
     is_peak,
-    next_transition,
     now_in,
     parse_periods,
     parse_weekdays,
@@ -73,6 +72,70 @@ class FatFishWalletGuard(Star):
 
     def _weekdays(self):
         return parse_weekdays(str(self._cfg("peak_weekdays", "0,1,2,3,4,5,6") or ""))
+
+    def get_wallet_policy(
+        self,
+        *,
+        at: datetime | None = None,
+        provider_id: str | None = None,
+    ) -> dict:
+        """Return the read-only wallet gate policy for another plugin or UI."""
+        timezone_name = str(self._cfg("timezone", "Asia/Shanghai") or "Asia/Shanghai")
+        zone = get_zoneinfo(timezone_name)
+        if zone is None:
+            timezone_name = "Asia/Shanghai"
+            zone = get_zoneinfo(timezone_name)
+        if at is None:
+            local_at = now_in(zone)
+        elif at.tzinfo is None:
+            local_at = at.replace(tzinfo=zone) if zone else at.astimezone()
+        else:
+            local_at = at.astimezone(zone) if zone else at.astimezone()
+
+        enabled = bool(self._cfg("enabled", True))
+        override = str(self._cfg("manual_override", "auto") or "auto")
+        try:
+            provider = self.context.get_provider_by_id(provider_id) if provider_id else None
+        except Exception:
+            provider = None
+        affected = self._provider_affected(provider_id, provider)
+        holiday_name = ""
+        try:
+            import holidays
+
+            holiday_name = str(holidays.CN().get(local_at.date()) or "")
+        except Exception as exc:
+            logger.warning(
+                f"[大肥鱼钱包保卫战] holidays.CN() 不可用，按星期/时段计算：{exc}"
+            )
+        holiday = bool(holiday_name)
+
+        if not enabled:
+            state, allowed = "offpeak", True
+        elif override == "always_allow":
+            state, allowed = "forced allow", True
+        elif override == "always_block":
+            state, allowed = "forced block", False
+        else:
+            peak = False if holiday else is_peak(
+                local_at, self._periods(), self._weekdays()
+            )
+            state = "peak" if peak else "offpeak"
+            allowed = not affected or not peak
+
+        return {
+            "enabled": enabled,
+            "allowed": allowed,
+            "state": state,
+            "timezone": timezone_name,
+            "manual_override": override,
+            "provider_affected": affected,
+            "holiday": holiday,
+            "holiday_name": holiday_name,
+            "peak_periods": str(self._cfg("peak_periods", DEFAULT_PEAK_PERIODS)),
+            "peak_weekdays": str(self._cfg("peak_weekdays", "0,1,2,3,4,5,6") or ""),
+            "evaluated_at": local_at,
+        }
 
     def _render(self, tmpl, provider="") -> str:
         s = str(tmpl)
@@ -289,10 +352,10 @@ class FatFishWalletGuard(Star):
 
     # 高峰闸门
 
-    async def _gate_decision(self, event, now, peak):
-        if not self._cfg("enabled", True):
+    def _gate_decision(self, event, policy):
+        if not policy["enabled"]:
             return False, ""
-        override = str(self._cfg("manual_override", "auto") or "auto")
+        override = policy["manual_override"]
         if override == "always_allow":
             return False, ""
         if self._cfg("admins_bypass", True) and event.is_admin():
@@ -301,10 +364,9 @@ class FatFishWalletGuard(Star):
             return False, "whitelist"
         if override == "always_block":
             return True, "manual"
-        if not peak:
+        if policy["state"] != "peak":
             return False, ""
-        provider_id, prov = await self._get_current_provider(event.unified_msg_origin)
-        if not self._provider_affected(provider_id, prov):
+        if not policy["provider_affected"]:
             return False, "provider"
         return True, "peak"
 
@@ -314,7 +376,7 @@ class FatFishWalletGuard(Star):
     )
     async def peak_gate(self, event: AstrMessageEvent):
         try:
-            if not self._cfg("enabled", True) or self._is_my_command(event):
+            if self._is_my_command(event):
                 return
             await self._load_known_groups()
             self._record_group(event)
@@ -323,9 +385,11 @@ class FatFishWalletGuard(Star):
                 return
             await self._load_whitelist()
             now = self._now()
-            peak = is_peak(now, self._periods(), self._weekdays())
-            gated, reason = await self._gate_decision(event, now, peak)
-            override = str(self._cfg("manual_override", "auto") or "auto")
+            provider_id, _ = await self._get_current_provider(event.unified_msg_origin)
+            policy = self.get_wallet_policy(at=now, provider_id=provider_id)
+            peak = policy["state"] == "peak"
+            gated, reason = self._gate_decision(event, policy)
+            override = policy["manual_override"]
             can_notice = await self._can_notice(event)
 
             if gated:
@@ -469,20 +533,19 @@ class FatFishWalletGuard(Star):
             return
 
         now = self._now()
-        periods = self._periods()
-        weekdays = self._weekdays()
-        peak = is_peak(now, periods, weekdays)
-        target, when = next_transition(now, periods, weekdays)
         provider_id, prov = await self._get_current_provider(event.unified_msg_origin)
-        affected = self._provider_affected(provider_id, prov)
-        override = str(self._cfg("manual_override", "auto") or "auto")
+        policy = self.get_wallet_policy(at=now, provider_id=provider_id)
+        peak = policy["state"] == "peak"
+        target, when = self._next_policy_transition(now, provider_id)
+        affected = policy["provider_affected"]
+        override = policy["manual_override"]
 
         if override == "always_allow":
             state = "手动放行中"
         elif override == "always_block":
             state = "手动拦截中"
-        elif not peak:
-            state = "服务正常（空闲时段）"
+        elif not policy["enabled"] or policy["allowed"]:
+            state = "服务正常（当前供应商不在拦截范围）" if peak and not affected else "服务正常（空闲时段）"
         elif not affected:
             state = "服务正常（当前供应商不在拦截范围）"
         elif self._cfg("admins_bypass", True) and event.is_admin():
@@ -496,13 +559,23 @@ class FatFishWalletGuard(Star):
         periods_txt = fmt_periods_for_display(
             str(self._cfg("peak_periods", DEFAULT_PEAK_PERIODS))
         )
-        remain_txt = fmt_duration((when - now).total_seconds())
-        next_txt = "高峰" if target == "peak" else "空闲"
+        period_label = {
+            "peak": "高峰",
+            "offpeak": "空闲",
+        }.get(policy["state"], "手动策略覆盖")
+        if target is None or when is None:
+            transition_txt = "当前策略下无预定切换"
+        else:
+            remain_txt = fmt_duration((when - now).total_seconds())
+            next_txt = "高峰" if target == "peak" else "空闲"
+            transition_txt = f"约 {remain_txt} → {next_txt}"
         lines = [
             "【大肥鱼钱包保卫战】",
-            f"当前时段：{'高峰' if peak else '空闲'}",
+            f"当前时段：{period_label}",
             f"时段配置：{periods_txt}",
-            f"下次切换：约 {remain_txt} → {next_txt}",
+            f"中国法定节假日：{policy['holiday_name'] or ('是' if policy['holiday'] else '否')}",
+            f"钱包策略：{policy['state']}（{'允许' if policy['allowed'] else '拦截'}）",
+            f"下次切换：{transition_txt}",
             f"模型供应商：{self._provider_status_text(provider_id, prov)}",
             f"服务状态：{state}",
             f"白名单：用户 {len(self._wl_users)} / 群 {len(self._wl_groups)}",
@@ -523,6 +596,34 @@ class FatFishWalletGuard(Star):
             if img.is_file():
                 chain.append(Image.fromFileSystem(str(img)))
         yield event.chain_result(chain)
+
+    def _datetime_at(self, now: datetime, seconds: int) -> datetime:
+        midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        return midnight + timedelta(seconds=int(seconds))
+
+    def _next_policy_transition(self, now: datetime, provider_id: str | None):
+        """Find the next natural state change by consulting shared policy."""
+        current = self.get_wallet_policy(at=now, provider_id=provider_id)
+        if not current["enabled"] or current["manual_override"] != "auto":
+            return None, None
+        state = current["state"]
+        periods = self._periods()
+        for day_offset in range(15):
+            day = now + timedelta(days=day_offset)
+            midnight = day.replace(hour=0, minute=0, second=0, microsecond=0)
+            candidates = [midnight]
+            for period in periods:
+                candidates.append(self._datetime_at(midnight, period.start))
+                candidates.append(self._datetime_at(midnight, period.end))
+            for candidate in sorted(set(candidates)):
+                if candidate <= now:
+                    continue
+                policy = self.get_wallet_policy(at=candidate, provider_id=provider_id)
+                candidate_state = policy["state"]
+                if candidate_state != state:
+                    return candidate_state, candidate
+                state = candidate_state
+        return None, None
 
     # 指令：/白名单
 
@@ -586,12 +687,6 @@ class FatFishWalletGuard(Star):
 
     # 时段定时提醒
 
-    def _datetime_at(self, now: datetime, seconds: int) -> datetime:
-        h, rem = divmod(int(seconds), 3600)
-        m = rem // 60
-        s = rem % 60
-        return now.replace(hour=h, minute=m, second=s)
-
     async def _send_reminder(self, kind):
         if kind == "peak":
             tmpl = self._cfg(
@@ -613,18 +708,20 @@ class FatFishWalletGuard(Star):
             except Exception as e:
                 logger.error(f"[大肥鱼钱包保卫战] 发送提醒到 {umo} 失败: {e}")
 
-    async def _check_reminders(self):
+    async def _check_reminders(self, now: datetime | None = None):
         if not self._cfg("reminder_enabled", True):
             return
-        if str(self._cfg("manual_override", "auto") or "auto") != "auto":
+        now = now or self._now()
+        current_policy = self.get_wallet_policy(at=now, provider_id=None)
+        if (
+            not current_policy["enabled"]
+            or current_policy["manual_override"] != "auto"
+            or current_policy["holiday"]
+        ):
             return
-        now = self._now()
         today = now.strftime("%Y-%m-%d")
         periods = self._periods()
-        weekdays = self._weekdays()
         if not periods:
-            return
-        if weekdays and now.weekday() not in weekdays:
             return
         lead = max(0, int(self._cfg("reminder_lead_minutes", 5)))
         fired = await self.get_kv_data("reminder_fired", {}) or {}
@@ -633,10 +730,23 @@ class FatFishWalletGuard(Star):
         done = set(fired.get("events", []))
         events = []
         for i, p in enumerate(periods):
-            start_at = self._datetime_at(now, p.start) - timedelta(minutes=lead)
-            end_at = self._datetime_at(now, p.end)
+            peak_start = self._datetime_at(now, p.start)
+            peak_start_policy = self.get_wallet_policy(at=peak_start, provider_id=None)
+            if peak_start_policy["state"] != "peak":
+                continue
+            start_at = peak_start - timedelta(minutes=lead)
+            peak_end = self._datetime_at(now, p.end)
+            before_end_policy = self.get_wallet_policy(
+                at=peak_end - timedelta(seconds=1), provider_id=None
+            )
+            after_end_policy = self.get_wallet_policy(at=peak_end, provider_id=None)
+            end_at = peak_end
             events.append((f"peakstart_{i}", start_at, "peak"))
-            events.append((f"peakend_{i}", end_at, "offpeak"))
+            if (
+                before_end_policy["state"] == "peak"
+                and after_end_policy["state"] == "offpeak"
+            ):
+                events.append((f"peakend_{i}", end_at, "offpeak"))
         changed = False
         for key, moment, kind in events:
             if key in done:
@@ -661,9 +771,12 @@ class FatFishWalletGuard(Star):
     async def initialize(self):
         await self._load_whitelist()
         await self._load_known_groups()
-        peak = is_peak(self._now(), self._periods(), self._weekdays())
+        now = self._now()
+        policy = self.get_wallet_policy(at=now, provider_id=None)
         logger.info(
-            f"[大肥鱼钱包保卫战] 已加载，当前{'高峰' if peak else '空闲'}时段，"
+            f"[大肥鱼钱包保卫战] 已加载，当前策略 {policy['state']}，"
+            f"{'允许' if policy['allowed'] else '拦截'}，"
+            f"法定节假日：{policy['holiday_name'] or ('是' if policy['holiday'] else '否')}，"
             f"白名单用户 {len(self._wl_users)} / 群 {len(self._wl_groups)}"
         )
         if self._cfg("reminder_enabled", True):
