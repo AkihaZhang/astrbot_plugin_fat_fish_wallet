@@ -109,6 +109,7 @@
 | `manual_block_msg` | 手动拦截提示 | 同上 |
 | `manual_override` | `auto` | `auto` 按时段 / `always_allow` 一律放行 / `always_block` 一律拦截 |
 | `announce_transition` | `true` | 时段切换时发不发提示 |
+| `transition_notice_window_minutes` | `10` | 切换提示只在切换后这么多分钟内发，`0` 表示不限制 |
 | `private_notify_mode` | `once` | 私信高峰提示频率，`once` 每天一次 / `always` 每次 / `never` 不提示 |
 | `whitelist_users` / `whitelist_groups` | `[]` | 初始白名单，之后用 `/白名单` 管 |
 | `reminder_enabled` | `true` | 定时提醒的总开关 |
@@ -190,6 +191,12 @@ astrbot_plugin_fat_fish_wallet/
 **高峰期私信一直弹提示？**
 
 私信默认每个会话一天只提示一次。嫌少就把 `private_notify_mode` 改成 `always`，嫌烦就改成 `never`。
+
+**切换点会不会连发好几条一样的提示？**
+
+以前会，现在不会了。AstrBot 给每条消息单开一个任务，切换那一刻同时进来的几条消息本来就是并发的，老版本里它们各自都判断出「该提示了」，于是各发一条。现在改成「谁先抢到谁发」：同一个切换点、同一个会话只有一条能发出去。定时提醒和这条回复也共用一份额度，所以同一个群不会既收到提醒、又收到回复。
+
+顺带一提，切换过去超过 `transition_notice_window_minutes`（默认 10 分钟）就不再补发了。下午三点有人在群里随口说一句，机器人不该突然回你「已到达空闲时段」。
 
 **我明明在高峰时段，怎么没被拦？**
 

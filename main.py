@@ -22,6 +22,37 @@ from .scheduler import (
 
 ASSETS = Path(__file__).resolve().parent / "assets"
 MY_COMMANDS = ("峰谷", "谷", "时段", "peak", "钱包", "白名单", "wl", "whitelist")
+REMINDER_WINDOW = timedelta(minutes=3)
+
+
+class _NoticeLedger:
+    """进程内的一次性认领表，用来保证「同一个切换点、同一个会话只喊一次」。
+
+    AstrBot 的事件总线是每条消息一个 asyncio 任务，同一瞬间可能有好几条消息
+    同时跑进闸门。只要判定和落盘之间隔着 await，它们就都会读到「还没喊过」，
+    于是连着发好几条一样的提示。
+
+    claim() 全程没有 await，在 asyncio 单线程下「查 + 占位」是原子的，所以并发
+    进来的任务里只有一个能拿到 True。放在模块级是因为插件重载后新旧实例可能
+    同时活着（旧实例的提醒循环还没被取消），共享一份账本才不会各喊各的。
+    """
+
+    def __init__(self) -> None:
+        self._day = ""
+        self._keys: set[str] = set()
+
+    def claim(self, day: str, key: str) -> bool:
+        if day != self._day:
+            self._day = day
+            self._keys.clear()
+        if key in self._keys:
+            return False
+        self._keys.add(key)
+        return True
+
+
+NOTICE_LEDGER = _NoticeLedger()
+
 
 _PROVIDER_NAMES = {
     "deepseek": "DeepSeek",
@@ -72,6 +103,49 @@ class FatFishWalletGuard(Star):
 
     def _weekdays(self):
         return parse_weekdays(str(self._cfg("peak_weekdays", "0,1,2,3,4,5,6") or ""))
+
+    def _segment_at(self, at: datetime) -> tuple[datetime, str]:
+        """当前处在哪个「状态段」的开头，以及这段是高峰还是空闲。
+
+        端点全部取时钟时刻，所以同一段时间里反复算出来的起点完全一致，用它做
+        认领键才不会因为并发算出两个不同的值。
+        """
+        midnight = at.replace(hour=0, minute=0, second=0, microsecond=0)
+        periods = self._periods()
+        if not periods or self.get_wallet_policy(at=at, provider_id=None)["holiday"]:
+            # 节假日整天按空闲算，一整天就是一个段
+            return midnight, "offpeak"
+
+        weekdays = self._weekdays()
+
+        def state_of(moment: datetime) -> str:
+            return "peak" if is_peak(moment, periods, weekdays) else "offpeak"
+
+        marks = {midnight}
+        for period in periods:
+            marks.add(self._datetime_at(midnight, period.start))
+            marks.add(self._datetime_at(midnight, period.end))
+        state = state_of(at)
+        start = midnight
+        # 从最近的一个端点往回走，只要状态一样就继续往前，直到撞上状态不同的一刻
+        for mark in sorted((m for m in marks if m <= at), reverse=True):
+            if state_of(mark) != state:
+                break
+            start = mark
+        return start, state
+
+    def _boundary_key(self, at: datetime) -> tuple[str, str, datetime]:
+        """返回 (日期, 认领键, 段起点)。认领键与状态段一一对应。"""
+        start, state = self._segment_at(at)
+        midnight = start.replace(hour=0, minute=0, second=0, microsecond=0)
+        seconds = int((start - midnight).total_seconds())
+        day = start.strftime("%Y-%m-%d")
+        return day, f"{day}:{seconds}:{state}", start
+
+    def _claim_notice(self, at: datetime, umo: str, suffix: str = "") -> bool:
+        """认领「这个切换点要往这个会话喊一声」。并发进来的只有一个能拿到 True。"""
+        day, key, _ = self._boundary_key(at)
+        return NOTICE_LEDGER.claim(day, f"{key}|{umo}{suffix}")
 
     def get_wallet_policy(
         self,
@@ -292,25 +366,7 @@ class FatFishWalletGuard(Star):
                 out.extend(u for u in sorted(self._known_groups) if t in u)
         return list(dict.fromkeys(out))
 
-    # 状态与统计（只记录自然时段切换，不受手动开关影响）
-
-    async def _period_state(self):
-        try:
-            data = await self.get_kv_data("period_state", {}) or {}
-            if data.get("date") != self._now().strftime("%Y-%m-%d"):
-                return None
-            return data.get("state")
-        except Exception:
-            return None
-
-    async def _save_period_state(self, state):
-        try:
-            await self.put_kv_data(
-                "period_state",
-                {"date": self._now().strftime("%Y-%m-%d"), "state": state},
-            )
-        except Exception:
-            pass
+    # 统计
 
     async def _bump_stats(self, key):
         try:
@@ -385,27 +441,28 @@ class FatFishWalletGuard(Star):
                 return
             await self._load_whitelist()
             now = self._now()
-            provider_id, _ = await self._get_current_provider(event.unified_msg_origin)
+            umo = event.unified_msg_origin
+            provider_id, _ = await self._get_current_provider(umo)
             policy = self.get_wallet_policy(at=now, provider_id=provider_id)
             peak = policy["state"] == "peak"
             gated, reason = self._gate_decision(event, policy)
             override = policy["manual_override"]
-            can_notice = await self._can_notice(event)
 
             if gated:
                 event.should_call_llm(False)
                 event.stop_event()
                 await self._bump_stats("blocked")
-                if not can_notice:
+                if not await self._can_notice(event):
                     return
-                provider = await self._provider_name(event.unified_msg_origin)
+                provider = await self._provider_name(umo)
                 if reason == "manual":
                     msg = self._cfg(
                         "manual_block_msg", "服务已被管理员手动关闭（拦截），等待恢复。"
                     )
                 else:
-                    enter = await self._period_state() != "peak"
-                    if enter:
+                    # 同一段高峰里每个会话只讲一次「已进入」，其余用「当前处于」，
+                    # 并发进来的消息里只有一个能认领到，不会连发
+                    if self._claim_notice(now, umo, "|peak-enter"):
                         msg = self._cfg(
                             "peak_msg_enter",
                             "已进入高峰时段，{provider} 高峰时段费用太贵，该时段将停止服务至空闲时段，到时自动恢复。",
@@ -415,7 +472,6 @@ class FatFishWalletGuard(Star):
                             "peak_msg_steady",
                             "当前处于高峰时段，{provider} 费用太贵，服务已暂停，空闲时段自动恢复。",
                         )
-                    await self._save_period_state("peak")
                 await event.send(
                     self._notice(msg, self._cfg("peak_image", "高峰时段.png"), provider)
                 )
@@ -427,26 +483,39 @@ class FatFishWalletGuard(Star):
 
             # 仅自动模式下处理自然时段切换提示
             if not peak and override == "auto":
-                if (
-                    self._cfg("announce_transition", True)
-                    and await self._period_state() == "peak"
-                    and can_notice
-                ):
-                    provider = await self._provider_name(event.unified_msg_origin)
-                    await event.send(
-                        self._notice(
-                            self._cfg(
-                                "offpeak_msg",
-                                "已到达空闲时段，服务恢复，可以正常使用了。",
-                            ),
-                            self._cfg("offpeak_image", "空闲时段.png"),
-                            provider,
-                        )
-                    )
-                    await self._mark_notified(event)
-                await self._save_period_state("offpeak")
+                await self._announce_offpeak(event, now, umo)
         except Exception as e:
             logger.error(f"[大肥鱼钱包保卫战] peak_gate 异常: {e}")
+
+    async def _announce_offpeak(self, event, now, umo):
+        """空闲时段到了，往这个会话说一声。同一个切换点每个会话只说一次。
+
+        只在切换后的一小段时间内说，过期就不提了——不然下午五点有人在群里
+        随口一句，机器人突然回「已到达空闲时段」，看着很怪。
+        """
+        if not self._cfg("announce_transition", True):
+            return
+        window = max(0, int(self._cfg("transition_notice_window_minutes", 10)))
+        _, _, segment_start = self._boundary_key(now)
+        if window and (now - segment_start) > timedelta(minutes=window):
+            return
+        # 先认领再发：提醒循环用的是同一把钥匙，所以同一个群里不会既收提醒又收这条
+        if not self._claim_notice(now, umo):
+            return
+        if not await self._can_notice(event):
+            return
+        provider = await self._provider_name(umo)
+        await event.send(
+            self._notice(
+                self._cfg(
+                    "offpeak_msg",
+                    "已到达空闲时段，服务恢复，可以正常使用了。",
+                ),
+                self._cfg("offpeak_image", "空闲时段.png"),
+                provider,
+            )
+        )
+        await self._mark_notified(event)
 
     async def _can_notice(self, event) -> bool:
         if not event.is_private_chat():
@@ -456,8 +525,14 @@ class FatFishWalletGuard(Star):
             return False
         if mode == "always":
             return True
-        notified = await self._private_notified_today(event.unified_msg_origin)
-        return event.unified_msg_origin not in notified
+        umo = event.unified_msg_origin
+        # 先在进程内原子占位，再读 KV：同一秒并发进来的私信只有一个能放行，
+        # KV 那份只是给重启后留个记号
+        today = self._now().strftime("%Y-%m-%d")
+        if not NOTICE_LEDGER.claim(today, f"{today}|{umo}|private-notice"):
+            return False
+        notified = await self._private_notified_today(umo)
+        return umo not in notified
 
     async def _mark_notified(self, event):
         if not event.is_private_chat():
@@ -687,7 +762,7 @@ class FatFishWalletGuard(Star):
 
     # 时段定时提醒
 
-    async def _send_reminder(self, kind):
+    async def _send_reminder(self, kind, targets):
         if kind == "peak":
             tmpl = self._cfg(
                 "reminder_peak_msg",
@@ -701,8 +776,7 @@ class FatFishWalletGuard(Star):
             )
             image = str(self._cfg("offpeak_image", "空闲时段.png"))
         chain = self._notice(tmpl, image)
-        await self._load_known_groups()
-        for umo in self._resolve_reminder_targets():
+        for umo in targets:
             try:
                 await self.context.send_message(umo, chain)
             except Exception as e:
@@ -723,6 +797,7 @@ class FatFishWalletGuard(Star):
         periods = self._periods()
         if not periods:
             return
+        await self._load_known_groups()
         lead = max(0, int(self._cfg("reminder_lead_minutes", 5)))
         fired = await self.get_kv_data("reminder_fired", {}) or {}
         if fired.get("date") != today:
@@ -734,29 +809,39 @@ class FatFishWalletGuard(Star):
             peak_start_policy = self.get_wallet_policy(at=peak_start, provider_id=None)
             if peak_start_policy["state"] != "peak":
                 continue
-            start_at = peak_start - timedelta(minutes=lead)
             peak_end = self._datetime_at(now, p.end)
             before_end_policy = self.get_wallet_policy(
                 at=peak_end - timedelta(seconds=1), provider_id=None
             )
             after_end_policy = self.get_wallet_policy(at=peak_end, provider_id=None)
-            end_at = peak_end
-            events.append((f"peakstart_{i}", start_at, "peak"))
+            events.append(
+                (f"peakstart_{i}", peak_start - timedelta(minutes=lead), "peak", peak_start)
+            )
             if (
                 before_end_policy["state"] == "peak"
                 and after_end_policy["state"] == "offpeak"
             ):
-                events.append((f"peakend_{i}", end_at, "offpeak"))
+                events.append((f"peakend_{i}", peak_end, "offpeak", peak_end))
+
         changed = False
-        for key, moment, kind in events:
+        for key, moment, kind, boundary_at in events:
             if key in done:
                 continue
-            if moment <= now < moment + timedelta(minutes=3):
-                await self._send_reminder(kind)
-                done.add(key)
-                changed = True
+            if not (moment <= now < moment + REMINDER_WINDOW):
+                continue
+            # 每个目标单独认领：已经通过闸门收到过这条提示的会话不再重复推一遍
+            targets = []
+            for umo in self._resolve_reminder_targets():
+                if self._claim_notice(boundary_at, umo):
+                    targets.append(umo)
+            if targets:
+                await self._send_reminder(kind, targets)
+            done.add(key)
+            changed = True
         if changed:
-            await self.put_kv_data("reminder_fired", {"date": today, "events": sorted(done)})
+            await self.put_kv_data(
+                "reminder_fired", {"date": today, "events": sorted(done)}
+            )
 
     async def _reminder_loop(self):
         while True:

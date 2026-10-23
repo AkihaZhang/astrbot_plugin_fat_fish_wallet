@@ -80,6 +80,11 @@
     "type": "bool",
     "default": true
   },
+  "transition_notice_window_minutes": {
+    "description": "切换提示只在切换后多少分钟内发（0=不限制）",
+    "type": "int",
+    "default": 10
+  },
   "private_notify_mode": {
     "description": "私信高峰提示频率：once=每天一次/always=每次/never=不提示",
     "type": "string",
