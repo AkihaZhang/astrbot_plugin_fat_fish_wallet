@@ -3,6 +3,7 @@
 import asyncio
 from datetime import datetime, timedelta
 from pathlib import Path
+from sys import maxsize
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
@@ -414,6 +415,43 @@ class FatFishWalletGuard(Star):
         return any(msg == n or msg.startswith(n + " ") for n in MY_COMMANDS)
 
     # 高峰闸门
+
+    async def _guard_model_request(self, event: AstrMessageEvent):
+        """Guard actual pipeline requests, including non-wake random replies.
+
+        AstrBot's built-in random reply handler can yield a ProviderRequest
+        before peak_gate runs. Request hooks run before the paid model call
+        while allowing the incoming group message to be recorded normally.
+        """
+        await self._load_whitelist()
+        provider_id, _ = await self._get_current_provider(event.unified_msg_origin)
+        policy = self.get_wallet_policy(at=self._now(), provider_id=provider_id)
+        gated, _ = self._gate_decision(event, policy)
+        if not gated:
+            return
+        if event.is_at_or_wake_command:
+            # Keep the existing wake/mention notice and private notice limits.
+            await self.peak_gate(event)
+            return
+        await self._load_known_groups()
+        self._record_group(event)
+        event.should_call_llm(False)
+        event.stop_event()
+        await self._bump_stats("blocked")
+        logger.info(
+            "[大肥鱼钱包保卫战] 已静默拦截非唤醒模型请求："
+            f"{event.unified_msg_origin}，策略 {policy['state']}"
+        )
+
+    @filter.on_waiting_llm_request(priority=maxsize)
+    async def guard_before_waiting(self, event: AstrMessageEvent):
+        """Block before queueing or building an agent."""
+        await self._guard_model_request(event)
+
+    @filter.on_llm_request(priority=maxsize)
+    async def guard_before_model(self, event: AstrMessageEvent, req):
+        """Recheck in case a request waited across the peak-time boundary."""
+        await self._guard_model_request(event)
 
     def _gate_decision(self, event, policy):
         if not policy["enabled"]:
